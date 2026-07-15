@@ -530,22 +530,25 @@ function pickBestVoice(){
   if(!('speechSynthesis' in window)) return null;
   const voices = window.speechSynthesis.getVoices();
   if(!voices.length) return null;
-  // Prefer higher-quality "natural"/neural voices when the device has them,
-  // then well-known warm-sounding system voices, before falling back to
-  // whatever default English voice is available.
+  // On-device ("local") voices are far more reliable than network-backed
+  // ones — some Android TTS stacks silently drop speech if a network
+  // voice can't be reached, which is a common cause of "works on one
+  // device, silent on another." Prefer local voices first.
+  const localVoices = voices.filter(v => v.localService);
+  const searchIn = localVoices.length ? localVoices : voices;
   const preferredMatches = [
     /natural/i, /neural/i,
     /Google US English/i, /Google UK English Female/i,
     /Samantha/i, /Karen/i, /Moira/i, /Tessa/i, /Aria/i, /Jenny/i
   ];
   for(const pattern of preferredMatches){
-    const v = voices.find(v => pattern.test(v.name) && v.lang && v.lang.startsWith('en'));
+    const v = searchIn.find(v => pattern.test(v.name) && v.lang && v.lang.startsWith('en'));
     if(v) return v;
   }
-  const enFemale = voices.find(v => v.lang && v.lang.startsWith('en') && /female/i.test(v.name));
+  const enFemale = searchIn.find(v => v.lang && v.lang.startsWith('en') && /female/i.test(v.name));
   if(enFemale) return enFemale;
-  const en = voices.find(v => v.lang && v.lang.startsWith('en'));
-  return en || voices[0];
+  const en = searchIn.find(v => v.lang && v.lang.startsWith('en'));
+  return en || searchIn[0] || voices[0];
 }
 if('speechSynthesis' in window){
   bestVoice = pickBestVoice();
@@ -563,18 +566,49 @@ function showBubble(text){
 /* Speaks one natural sentence at a time. Passing an array joins the parts
    with punctuation into a SINGLE utterance — one continuous TTS render
    sounds far more natural than chaining separate utterances, which tends
-   to sound choppy and robotic with browser voices. */
+   to sound choppy and robotic with browser voices.
+
+   Some Android Chrome builds (notably on Pixel devices) silently drop the
+   next speak() call if it's fired immediately after cancel() — a known
+   platform race condition. A short delay before speaking, plus a retry
+   with the browser's own default voice if nothing seems to start, works
+   around it without affecting devices that don't have the bug. */
 function speak(input, opts={}){
   if(!('speechSynthesis' in window)) return;
   const text = Array.isArray(input) ? input.join('. ') + '.' : input;
   lastSpokenText = text;
-  window.speechSynthesis.cancel();
   showBubble(Array.isArray(input) ? input.join('  ·  ') : input);
-  const u = new SpeechSynthesisUtterance(text);
-  u.rate = opts.rate || 0.9;
-  u.pitch = opts.pitch || 1.05;
-  if(bestVoice) u.voice = bestVoice;
-  window.speechSynthesis.speak(u);
+
+  window.speechSynthesis.cancel();
+  clearTimeout(speak._retryTimer);
+
+  function fire(useVoice){
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = opts.rate || 0.9;
+    u.pitch = opts.pitch || 1.05;
+    if(useVoice) u.voice = useVoice;
+    let started = false;
+    u.onstart = ()=>{ started = true; };
+    u.onerror = ()=>{
+      if(!started && useVoice){
+        // The chosen voice failed outright — retry once with the device default.
+        fire(null);
+      }
+    };
+    window.speechSynthesis.speak(u);
+    // Safety net: if nothing started within a beat, some Android builds
+    // just dropped it silently. Try once more with no explicit voice.
+    speak._retryTimer = setTimeout(()=>{
+      if(!started && !window.speechSynthesis.speaking && useVoice){
+        fire(null);
+      }
+    }, 400);
+  }
+
+  setTimeout(()=>{
+    window.speechSynthesis.resume();
+    fire(bestVoice);
+  }, 60);
 }
 function speakSequence(parts, opts){ speak(parts, opts); }
 
