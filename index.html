@@ -512,8 +512,45 @@ function pickWeighted(items, weightFn){
   return items[items.length-1];
 }
 
+/* Fewer choices while she's still on the first group of a category keeps
+   quizzes simpler for a beginner; more choices unlock as she progresses. */
+function numChoicesFor(category){
+  const boundaries = category === 'letters' ? letterBoundaries : category === 'numbers' ? numberBoundaries : wordBoundaries;
+  const u = unlocked[category];
+  if(u <= boundaries[0]) return 2;
+  if(boundaries.length > 1 && u <= boundaries[1]) return 3;
+  return 4;
+}
+
 /* ---------------- Speech helpers ---------------- */
-let lastSpokenParts = ['Hi! I\'m Pip. Tap me anytime to hear that again!'];
+let lastSpokenText = "Hi! I'm Pip. Tap me anytime to hear that again!";
+let bestVoice = null;
+
+function pickBestVoice(){
+  if(!('speechSynthesis' in window)) return null;
+  const voices = window.speechSynthesis.getVoices();
+  if(!voices.length) return null;
+  // Prefer higher-quality "natural"/neural voices when the device has them,
+  // then well-known warm-sounding system voices, before falling back to
+  // whatever default English voice is available.
+  const preferredMatches = [
+    /natural/i, /neural/i,
+    /Google US English/i, /Google UK English Female/i,
+    /Samantha/i, /Karen/i, /Moira/i, /Tessa/i, /Aria/i, /Jenny/i
+  ];
+  for(const pattern of preferredMatches){
+    const v = voices.find(v => pattern.test(v.name) && v.lang && v.lang.startsWith('en'));
+    if(v) return v;
+  }
+  const enFemale = voices.find(v => v.lang && v.lang.startsWith('en') && /female/i.test(v.name));
+  if(enFemale) return enFemale;
+  const en = voices.find(v => v.lang && v.lang.startsWith('en'));
+  return en || voices[0];
+}
+if('speechSynthesis' in window){
+  bestVoice = pickBestVoice();
+  window.speechSynthesis.onvoiceschanged = ()=>{ bestVoice = pickBestVoice(); };
+}
 
 function showBubble(text){
   const b = document.getElementById('bubble');
@@ -523,27 +560,26 @@ function showBubble(text){
   showBubble._t = setTimeout(()=>b.classList.remove('show'), 3200);
 }
 
-function speakSequence(parts, opts={}){
+/* Speaks one natural sentence at a time. Passing an array joins the parts
+   with punctuation into a SINGLE utterance — one continuous TTS render
+   sounds far more natural than chaining separate utterances, which tends
+   to sound choppy and robotic with browser voices. */
+function speak(input, opts={}){
   if(!('speechSynthesis' in window)) return;
-  lastSpokenParts = parts;
+  const text = Array.isArray(input) ? input.join('. ') + '.' : input;
+  lastSpokenText = text;
   window.speechSynthesis.cancel();
-  const rate = opts.rate || 0.85;
-  let i = 0;
-  showBubble(parts.join('  ·  '));
-  function next(){
-    if(i >= parts.length) return;
-    const u = new SpeechSynthesisUtterance(parts[i]);
-    u.rate = rate;
-    u.pitch = 1.15;
-    u.onend = ()=>{ i++; next(); };
-    window.speechSynthesis.speak(u);
-  }
-  next();
+  showBubble(Array.isArray(input) ? input.join('  ·  ') : input);
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = opts.rate || 0.9;
+  u.pitch = opts.pitch || 1.05;
+  if(bestVoice) u.voice = bestVoice;
+  window.speechSynthesis.speak(u);
 }
-function speak(text, opts){ speakSequence([text], opts); }
+function speakSequence(parts, opts){ speak(parts, opts); }
 
 document.getElementById('pipBtn').addEventListener('click', ()=>{
-  speakSequence(lastSpokenParts);
+  speak(lastSpokenText);
 });
 
 /* ---------------- Confetti ---------------- */
@@ -713,20 +749,21 @@ function startLetterQuiz(){
   letterAttempts = 0;
   const pool = unlockedList('letters');
   const target = pickWeighted(pool, l => Math.max(1, 4 - mastery.letters[l.up].streak));
-  const distractors = shuffle(pool.filter(l=>l.up!==target.up)).slice(0,3);
+  const n = Math.min(numChoicesFor('letters'), pool.length);
+  const distractors = shuffle(pool.filter(l=>l.up!==target.up)).slice(0, n-1);
   const choices = shuffle([target, ...distractors]);
   const panel = document.getElementById('letterQuizPanel');
   panel.innerHTML = `
     <div class="quiz-box">
-      <p class="quiz-prompt">🔍 Can you find the letter <strong>${target.up}</strong>?</p>
+      <p class="quiz-prompt">🔍 Find the letter <strong>${target.up}</strong></p>
       <div class="quiz-choices" id="letterChoices"></div>
     </div>`;
-  speakSequence([`Can you find the letter ${target.up}?`]);
+  speak(`Can you find the letter ${target.up}?`);
   const choicesEl = document.getElementById('letterChoices');
   choices.forEach(c=>{
     const b = document.createElement('button');
     b.className = 'choice-btn';
-    b.textContent = c.up;
+    b.innerHTML = `${c.up}<span class="emoji">${c.emoji}</span>`;
     b.dataset.key = c.up;
     b.addEventListener('click', ()=>{
       if(c.up === target.up){
@@ -739,8 +776,8 @@ function startLetterQuiz(){
         saveProgress();
         renderLetterGrid();
         if(milestoneHit){ /* celebration overlay already spoke */ }
-        else if(leveledUp){ speakSequence([randomFrom(PRAISE), 'You unlocked new letters!']); announceLevelUp('letters'); }
-        else{ speakSequence([randomFrom(PRAISE), `That is ${target.up}!`]); }
+        else if(leveledUp){ speak([randomFrom(PRAISE), 'You unlocked new letters!']); announceLevelUp('letters'); }
+        else{ speak([randomFrom(PRAISE), `That is ${target.up}!`]); }
         scheduleNext(startLetterQuiz, 1600);
       } else {
         letterAttempts++;
@@ -836,20 +873,22 @@ function startNumberQuiz(){
   numberAttempts = 0;
   const pool = unlockedList('numbers');
   const target = pickWeighted(pool, n => Math.max(1, 4 - mastery.numbers[String(n)].streak));
-  const distractors = shuffle(pool.filter(n=>n!==target)).slice(0,3);
+  const n = Math.min(numChoicesFor('numbers'), pool.length);
+  const distractors = shuffle(pool.filter(x=>x!==target)).slice(0, n-1);
   const choices = shuffle([target, ...distractors]);
   const panel = document.getElementById('numberQuizPanel');
   panel.innerHTML = `
     <div class="quiz-box">
-      <p class="quiz-prompt">🔍 Can you find the number <strong>${target}</strong>?</p>
+      <p class="quiz-prompt">🔍 Find the number <strong>${target}</strong></p>
       <div class="quiz-choices" id="numberChoices"></div>
     </div>`;
-  speakSequence([`Can you find the number ${target}?`]);
+  speak(`Can you find the number ${target}?`);
   const choicesEl = document.getElementById('numberChoices');
   choices.forEach(c=>{
     const b = document.createElement('button');
     b.className = 'choice-btn';
-    b.textContent = c;
+    const dots = OBJECT_EMOJI.repeat(Math.min(c,10)) + (c>10 ? '…' : '');
+    b.innerHTML = `${c}<span class="emoji" style="font-size:0.85rem; letter-spacing:-3px;">${dots}</span>`;
     b.dataset.key = String(c);
     b.addEventListener('click', ()=>{
       if(c === target){
@@ -862,8 +901,8 @@ function startNumberQuiz(){
         saveProgress();
         renderNumberGrid();
         if(milestoneHit){ /* celebration overlay already spoke */ }
-        else if(leveledUp){ speakSequence([randomFrom(PRAISE), 'You unlocked new numbers!']); announceLevelUp('numbers'); }
-        else{ speakSequence([randomFrom(PRAISE), `That is ${target}!`]); }
+        else if(leveledUp){ speak([randomFrom(PRAISE), 'You unlocked new numbers!']); announceLevelUp('numbers'); }
+        else{ speak([randomFrom(PRAISE), `That is ${target}!`]); }
         scheduleNext(startNumberQuiz, 1600);
       } else {
         numberAttempts++;
@@ -947,7 +986,8 @@ function startWordQuiz(){
   wordAttempts = 0;
   const pool = unlockedList('words');
   const target = pickWeighted(pool, w => Math.max(1, 4 - mastery.words[w.word].streak));
-  const distractors = shuffle(pool.filter(w=>w.word!==target.word)).slice(0,3);
+  const n = Math.min(numChoicesFor('words'), pool.length);
+  const distractors = shuffle(pool.filter(w=>w.word!==target.word)).slice(0, n-1);
   const choices = shuffle([target, ...distractors]);
   const panel = document.getElementById('wordQuizPanel');
   panel.innerHTML = `
@@ -955,7 +995,7 @@ function startWordQuiz(){
       <p class="quiz-prompt">🔍 Which word says this? <span style="font-size:2.4rem;">${target.emoji}</span></p>
       <div class="quiz-choices" id="wordChoices"></div>
     </div>`;
-  speakSequence([`Which word says ${target.word}?`]);
+  speak(`Which word says ${target.word}?`);
   const choicesEl = document.getElementById('wordChoices');
   choices.forEach(c=>{
     const b = document.createElement('button');
